@@ -22,7 +22,7 @@
 _version = "2024.08.06"
 
 #from typing import Any, Callable
-from itertools import groupby
+from itertools import groupby, islice
 from functools import reduce
 try: 
     import Rhino.Geometry as rg
@@ -30,6 +30,22 @@ try:
     import ghpythonlib.treehelpers as th
 except:
     print("Working outside Rhino/Grasshopper.  Some functionality is not available")
+
+import ctypes
+import os as _os
+_dll_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "normalize_link_c.dll")
+_normalize_c = None
+try:
+    _lib = ctypes.CDLL(_dll_path)
+    _lib.normalize_links_batch_c.argtypes = [
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)
+    ]
+    _lib.normalize_links_batch_c.restype = ctypes.c_int
+    _normalize_c = _lib
+    print("Loaded C accelerator:", _dll_path)
+except Exception as _e:
+    print("C accelerator not available:", _e)
 
 Polyline = "rg.Polyline"
 Vector = "tuple[int, int, int]"
@@ -246,6 +262,13 @@ INVERSE = [
     47,
 ]
 
+# Precomputed lookup: maps tuple of symmetry matrix rows -> index
+# Built from CUBE_SYMMETRY so symmetry_to_index() is O(1) instead of O(48)
+SYMMETRY_MATRIX_TO_INDEX = {
+    (f(1, 0, 0), f(0, 1, 0), f(0, 0, 1)): i
+    for i, f in enumerate(CUBE_SYMMETRY)
+}
+
 
 def compose(*perm_sign):
     # type: (*PermSign) -> PermSign
@@ -273,8 +296,6 @@ def compose_symmetries(symm1, symm2):
 def inverse_symmetry(symm):
     # type: (Symmetry) -> Symmetry
     """Inverse of symm.
-    
-    Warning: Not efficient
     """
     return CUBE_SYMMETRY[symmetry_to_index(symm)]
 
@@ -298,8 +319,6 @@ def symmetry_to_index(symm):
     
     Note that its inverse is CUBE_SYMMETRY[index].
     
-    Warning: This is not efficient.
-    
     The images of vectors (1, 0, 0), (0, 1, 0), and (0, 0, 1)
     uniquely determine the symmetry.
     
@@ -308,13 +327,8 @@ def symmetry_to_index(symm):
     >>> symmetry_to_index(CUBE_SYMMETRY[-1])
     47
     """
-    symm_matrix = symmetry_matrix(symm)
-    
-    for index, f in enumerate(CUBE_SYMMETRY):
-        if symmetry_matrix(f) == symm_matrix:
-            return index
-
-    return None
+    key = (symm(1, 0, 0), symm(0, 1, 0), symm(0, 0, 1))
+    return SYMMETRY_MATRIX_TO_INDEX.get(key)
 
 
 def transform_group(group, f):
@@ -835,6 +849,226 @@ def path_variations(path, lattice=None):
            )
 
 
+def cross_product(a, b):
+    # type: (Vector, Vector) -> Vector
+    """Cross product of two 3D integer vectors.
+    
+    >>> cross_product((1, 0, 0), (0, 1, 0))
+    (0, 0, 1)
+    >>> cross_product((1, 1, 0), (0, 1, 1))
+    (1, -1, 1)
+    """
+    return (a[1]*b[2] - a[2]*b[1],
+            a[2]*b[0] - a[0]*b[2],
+            a[0]*b[1] - a[1]*b[0])
+
+
+def dot_product(a, b):
+    # type: (Vector, Vector) -> int
+    """Dot product of two 3D integer vectors.
+    
+    >>> dot_product((1, 2, 3), (4, 5, 6))
+    32
+    """
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+
+def is_planar(path):
+    # type: (Path) -> tuple[Vector, int] | None
+    """Check if a closed path is planar.
+    Returns (normal, offset) where dot(normal, point) == offset for all points,
+    or None if the path is not planar or degenerate.
+    
+    >>> is_planar([(1, 0, 0), (0, 1, 0), (-1, 0, 0), (0, -1, 0)])
+    ((0, 0, 1), 0)
+    >>> is_planar([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)])
+    ((0, 0, 1), 0)
+    >>> is_planar([(0, 0, 0), (1, 0, 0), (1, 1, 1), (0, 1, 0)])
+    """
+    if len(path) < 3:
+        return None
+    # Find a non-degenerate normal from edges originating at path[0]
+    p0 = path[0]
+    e0 = (path[1][0] - p0[0], path[1][1] - p0[1], path[1][2] - p0[2])
+    normal = (0, 0, 0)
+    for k in range(2, len(path)):
+        ek = (path[k][0] - p0[0], path[k][1] - p0[1], path[k][2] - p0[2])
+        normal = cross_product(e0, ek)
+        if normal != (0, 0, 0):
+            break
+    if normal == (0, 0, 0):
+        return None  # all points are collinear
+    offset = dot_product(normal, p0)
+    # Check all points lie in this plane
+    for pt in path:
+        if dot_product(normal, pt) != offset:
+            return None
+    return (normal, offset)
+
+
+def _project_to_2d(point, normal):
+    # type: (Vector, Vector) -> tuple[float, float]
+    """Project a 3D point onto 2D by dropping the axis corresponding to
+    the largest component of the normal vector.
+    """
+    nx, ny, nz = abs(normal[0]), abs(normal[1]), abs(normal[2])
+    if nx >= ny and nx >= nz:
+        return (point[1], point[2])  # drop x
+    elif ny >= nz:
+        return (point[0], point[2])  # drop y
+    else:
+        return (point[0], point[1])  # drop z
+
+
+def point_in_polygon_2d(px, py, polygon_2d):
+    # type: (float, float, list[tuple[float, float]]) -> bool
+    """Ray casting algorithm for point-in-polygon test in 2D.
+    
+    >>> poly = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+    >>> point_in_polygon_2d(1.0, 1.0, poly)
+    True
+    >>> point_in_polygon_2d(3.0, 1.0, poly)
+    False
+    """
+    n = len(polygon_2d)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        yi, xi = polygon_2d[i][1], polygon_2d[i][0]
+        yj, xj = polygon_2d[j][1], polygon_2d[j][0]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _polygon_line_segments(polygon, normal, offset, line_dir):
+    # type: (Path, Vector, int, Vector) -> list[tuple[float, float]]
+    """Compute the segments where a polygon's filled interior intersects a plane.
+    
+    The cutting plane is defined by (normal, offset): dot(normal, P) = offset.
+    line_dir is the direction of the intersection line (cross product of normals).
+    
+    Returns a sorted list of (t_enter, t_exit) intervals along line_dir
+    representing where the polygon interior crosses the plane.
+    For non-convex polygons this may be multiple disjoint segments.
+    """
+    n = len(polygon)
+    dists = [dot_product(normal, polygon[i]) - offset for i in range(n)]
+    
+    # Collect crossing points where polygon edges cross the cutting plane.
+    # For vertices exactly on the plane (dist==0), only count as a crossing
+    # if the polygon passes through the plane (non-zero neighbors on opposite sides).
+    crossings = []
+    for i in range(n):
+        j = (i + 1) % n
+        d1, d2 = dists[i], dists[j]
+        if d1 == 0:
+            # Vertex on the plane. Find the last non-zero dist before and after.
+            prev_d = 0
+            for k in range(1, n):
+                prev_d = dists[(i - k) % n]
+                if prev_d != 0:
+                    break
+            next_d = 0
+            for k in range(1, n):
+                next_d = dists[(i + k) % n]
+                if next_d != 0:
+                    break
+            # Count as crossing only if prev and next are on strictly opposite sides
+            if prev_d != 0 and next_d != 0 and (prev_d > 0) != (next_d > 0):
+                crossings.append(dot_product(line_dir, polygon[i]))
+        elif d2 != 0 and (d1 > 0) != (d2 > 0):
+            # Edge properly crosses the plane
+            t = d1 / (d1 - d2)
+            pt = (polygon[i][0] + t * (polygon[j][0] - polygon[i][0]),
+                  polygon[i][1] + t * (polygon[j][1] - polygon[i][1]),
+                  polygon[i][2] + t * (polygon[j][2] - polygon[i][2]))
+            crossings.append(dot_product(line_dir, pt))
+        # d2 == 0 is handled when we process vertex j
+    
+    # Sort crossings and pair them into interior segments
+    crossings.sort()
+    segments = []
+    for k in range(0, len(crossings) - 1, 2):
+        segments.append((crossings[k], crossings[k + 1]))
+    return segments
+
+
+def curve_intersects_surface(curve, surface, normal, offset):
+    # type: (Path, Path, Vector, int) -> bool
+    """Check if any edge of curve crosses through the filled surface polygon.
+    
+    The surface is a planar polygon with the given normal and offset.
+    An edge crosses the surface if it crosses the plane (endpoints on opposite sides)
+    and the crossing point is inside the polygon boundary.
+    
+    >>> surf = [(-2, 0, 2), (-1, 0, 1), (0, 0, 0), (1, 0, -1), (2, 0, 0), (3, 0, 1), (4, 0, 2), (3, 0, 3), (2, 0, 4), (1, 0, 5), (0, 0, 4), (-1, 0, 3)]
+    >>> curve = [(1, -3, 0), (1, -2, -1), (1, -1, -2), (1, 0, -3), (1, 1, -2), (1, 2, -1), (1, 3, 0), (1, 2, 1), (1, 1, 2), (1, 0, 3), (1, -1, 2), (1, -2, 1)]
+    >>> n, o = is_planar(surf)
+    >>> curve_intersects_surface(curve, surf, n, o)
+    True
+    """
+    poly_2d = [_project_to_2d(pt, normal) for pt in surface]
+    nc = len(curve)
+    dists = [dot_product(normal, curve[i]) - offset for i in range(nc)]
+    for i in range(nc):
+        d1 = dists[i]
+        if d1 == 0:
+            # Vertex is on the plane. If it's inside the polygon, count it.
+            px, py = _project_to_2d(curve[i], normal)
+            if point_in_polygon_2d(px, py, poly_2d):
+                return True
+        else:
+            d2 = dists[(i + 1) % nc]
+            if d2 != 0 and (d1 > 0) != (d2 > 0):
+                # Edge properly crosses the plane
+                p1 = curve[i]
+                p2 = curve[(i + 1) % nc]
+                t = d1 / (d1 - d2)
+                ix = p1[0] + t * (p2[0] - p1[0])
+                iy = p1[1] + t * (p2[1] - p1[1])
+                iz = p1[2] + t * (p2[2] - p1[2])
+                px, py = _project_to_2d((ix, iy, iz), normal)
+                if point_in_polygon_2d(px, py, poly_2d):
+                    return True
+    return False
+
+
+def is_linked(link):
+    # type: (Link) -> bool
+    """Check if every path in a link intersects at least one other path's surface.
+    A link is kept only if NO path has zero intersections with all other surfaces.
+    """
+    n = len(link)
+    # Precompute planes for all paths
+    planes = [is_planar(p) for p in link]
+    for i in range(n):
+        # Does path i intersect any other path's surface?
+        has_intersection = False
+        for j in range(n):
+            if i == j:
+                continue
+            if planes[j] is None:
+                continue
+            normal, offset = planes[j]
+            if curve_intersects_surface(link[i], link[j], normal, offset):
+                has_intersection = True
+                break
+        if not has_intersection:
+            return False  # path i has zero intersections -> filter out
+    return True
+
+
+def filter_unlinked(links):
+    # type: (list[Link]) -> list[Link]
+    """Remove links where any path has zero intersections with other paths' surfaces.
+    """
+    result = [link for link in links if is_linked(link)]
+    print("Surface intersection filter: %d -> %d links" % (len(links), len(result)))
+    return result
+
+
 def normalize_paths(link):
     # type: (Link) -> Link
     """Normalize each path in link, and then sort them.
@@ -864,9 +1098,24 @@ def normalize_link(link, lattice=1):
     >>> normalize_link(link, 2)
     
     """
-    return min(normalize_paths(align_link(transform_link(f, link), lattice))
-               for f in CUBE_SYMMETRY
-              )
+    best = None
+    for f in CUBE_SYMMETRY:
+        transformed = align_link(transform_link(f, link), lattice)
+        # Normalize each path and sort, with early bail-out
+        normalized = sorted(normalize_path(path) for path in transformed)
+        if best is not None:
+            # Lexicographic early termination: compare path by path
+            skip = False
+            for np, bp in zip(normalized, best):
+                if np < bp:
+                    break  # candidate is better, keep it
+                elif np > bp:
+                    skip = True  # candidate is worse, discard
+                    break
+            if skip:
+                continue
+        best = normalized
+    return best
 
 
 def link_variations(link, lattice=None):
@@ -923,14 +1172,44 @@ def normalize_links(links, key=None, lattice=1):
     >>> normalize_links([(link, '0'), (link_, '1')], key=lambda t: t[0])
     [([[(0, 1, 1), (1, 0, 1), (2, 1, 1), (1, 2, 1)], [(1, 1, 1), (1, 2, 0), (1, 3, 1), (1, 2, 2)]], 0, ([[(1, 0, 0), (0, 1, 0), (-1, 0, 0), (0, -1, 0)], [(0, 0, 0), (1, 0, 1), (2, 0, 0), (1, 0, -1)]], '0')), ([[(0, 1, 1), (1, 0, 1), (2, 1, 1), (1, 2, 1)], [(1, 1, 1), (1, 2, 0), (1, 3, 1), (1, 2, 2)]], 1, ([[(0, 1, 0), (-1, 0, 0), (0, -1, 0), (1, 0, 0)], [(0, 0, 0), (0, 1, 1), (0, 2, 0), (0, 1, -1)]], '1'))]
     """
-    return ([(normalize_link(link, lattice), index, link)
-             for index, link in enumerate(links)
-            ]
-        if key is None
-        else [(normalize_link(key(t), lattice), index, t)
-              for index, t in enumerate(links)
-             ]
-    )
+    if key is not None:
+        return [(normalize_link(key(t), lattice), index, t)
+                for index, t in enumerate(links)]
+    # Try C batch acceleration
+    if _normalize_c is not None and links:
+        try:
+            num_links = len(links)
+            num_paths = len(links[0])
+            path_len = len(links[0][0])
+            link_ints = num_paths * path_len * 3
+            total_ints = num_links * link_ints
+            arr = (ctypes.c_int * total_ints)()
+            idx = 0
+            for link in links:
+                for path in link:
+                    for x, y, z in path:
+                        arr[idx] = x; arr[idx+1] = y; arr[idx+2] = z
+                        idx += 3
+            out = (ctypes.c_int * total_ints)()
+            rc = _normalize_c.normalize_links_batch_c(
+                arr, num_links, num_paths, path_len, lattice, out)
+            if rc == 0:
+                result = []
+                idx = 0
+                for i in range(num_links):
+                    norm_link = []
+                    for p in range(num_paths):
+                        norm_path = []
+                        for pt in range(path_len):
+                            norm_path.append((out[idx], out[idx+1], out[idx+2]))
+                            idx += 3
+                        norm_link.append(norm_path)
+                    result.append((norm_link, i, links[i]))
+                return result
+        except Exception:
+            pass  # fall through to pure Python
+    return [(normalize_link(link, lattice), index, link)
+            for index, link in enumerate(links)]
 
 
 def remove_duplicates(links, key=None, lattice=None):
@@ -994,6 +1273,64 @@ def pointset_path(path):
     return result
 
 
+class BitGrid:
+    """Maps 3D doubled-coordinates to bit positions in a Python int.
+    
+    All paths/prospects must share the same BitGrid instance so that
+    bit positions are consistent for intersection checks.
+    """
+    
+    def __init__(self, origin, size_y, size_z):
+        # type: (Vector, int, int) -> None
+        """origin: minimum (x, y, z) in doubled-coordinate space.
+        size_y, size_z: dimensions of the grid in y and z.
+        """
+        self.ox, self.oy, self.oz = origin
+        self.sy = size_y
+        self.sz = size_z
+    
+    def point_to_bit(self, x, y, z):
+        # type: (int, int, int) -> int
+        """Convert a doubled-coordinate point to a bitmask with one bit set."""
+        return 1 << (((x - self.ox) * self.sy + (y - self.oy)) * self.sz + (z - self.oz))
+    
+    def pointset_to_bits(self, pointset):
+        # type: (set[Vector]) -> int
+        """Convert a set of doubled-coordinate points to a bitmask."""
+        bits = 0
+        for x, y, z in pointset:
+            bits |= 1 << (((x - self.ox) * self.sy + (y - self.oy)) * self.sz + (z - self.oz))
+        return bits
+
+
+def make_bitgrid(paths):
+    # type: (list[Path]) -> BitGrid
+    """Create a BitGrid that covers all given paths (in original coordinates).
+    
+    Computes the bounding box over all doubled-coordinates
+    (vertices and edge midpoints) with some margin.
+    """
+    all_coords = []
+    for path in paths:
+        for x, y, z in path:
+            all_coords.append((2 * x, 2 * y, 2 * z))
+        path_rot = path[1:] + [path[0]]
+        for (x1, y1, z1), (x2, y2, z2) in zip(path, path_rot):
+            all_coords.append((x1 + x2, y1 + y2, z1 + z2))
+    
+    min_x = min(c[0] for c in all_coords) - 2
+    min_y = min(c[1] for c in all_coords) - 2
+    min_z = min(c[2] for c in all_coords) - 2
+    max_x = max(c[0] for c in all_coords) + 2
+    max_y = max(c[1] for c in all_coords) + 2
+    max_z = max(c[2] for c in all_coords) + 2
+    
+    size_y = max_y - min_y + 1
+    size_z = max_z - min_z + 1
+    
+    return BitGrid((min_x, min_y, min_z), size_y, size_z)
+
+
 def generate_shifts(min_vec, max_vec, offset=0, min_move=0, lattice=1):
     # type: (Vector, Vector, int, int) -> list[Vector]
     """Generate list of all vectors within the box shell, sorted on length,
@@ -1036,13 +1373,13 @@ def generate_shifts(min_vec, max_vec, offset=0, min_move=0, lattice=1):
 
 
 def tangle(links, pvs, lattice=1):
-    # type: (list[tuple[Link, list[int], set[Vector]]], list[tuple[Path, set[Vector]]]) -> list[tuple[Link, list[int], set[Vector]]]
+    # type: (list[tuple[Link, list[int], int]], list[tuple[Path, int]]) -> list[tuple[Link, list[int], int]]
     """Tangle each path in pvs into each link without intersection,
     removing symmetric results.
     
     Assumptions:
-    * links is list of links, path indices, and corresponding pointsets, and
-    * pvs is list of path variations and corresponding pointsets
+    * links is list of links, path indices, and corresponding bitmasks, and
+    * pvs is list of path variations and corresponding bitmasks
     * path segments are edges in the SC|FCC|BCC lattice
     
     >>> links = [(link, [-1], pointset_path(link[0]))
@@ -1054,18 +1391,44 @@ def tangle(links, pvs, lattice=1):
     >>> tangle(links, [(p, pointset_path(p)) for p in pvs])
     [([[(0, -1, 0), (0, 0, -1), (0, 1, 0), (0, 0, 1)], [(1, -1, 0), (1, 0, -1), (1, 1, 0), (1, 0, 1)]], [-1, 0], {(2, -2, 0), (0, -1, -1), (2, 1, 1), (2, 0, 2), (0, -1, 1), (0, 2, 0), (0, -2, 0), (2, 0, -2), (0, 0, 2), (2, -1, -1), (0, 0, -2), (2, -1, 1), (0, 1, -1), (2, 2, 0), (2, 1, -1), (0, 1, 1)}), ([[(0, -1, 0), (0, 0, -1), (0, 1, 0), (0, 0, 1)], [(0, 0, 0), (1, 0, -1), (2, 0, 0), (1, 0, 1)]], [-1, 1], {(0, -1, -1), (2, 0, 2), (1, 0, 1), (0, -1, 1), (1, 0, -1), (0, 2, 0), (0, 0, 0), (0, -2, 0), (2, 0, -2), (4, 0, 0), (0, 0, 2), (0, 0, -2), (3, 0, 1), (0, 1, -1), (3, 0, -1), (0, 1, 1)})]
     """
-    result = [(link + [path], pvs_indices + [pvs_index], link_ps | path_ps)
-              for link, pvs_indices, link_ps in links
-              for pvs_index, (path, path_ps)
-                  in enumerate(pvs[pvs_indices[-1] + 1:], pvs_indices[-1] + 1)
-#                   in enumerate(pvs)
-              if link_ps.isdisjoint(path_ps)
-             ]
+    if links and isinstance(links[0][2], int):
+        # Bit-based collision detection (fast path)
+        result = [(link + [path], pvs_indices + [pvs_index], link_bits | path_bits)
+                  for link, pvs_indices, link_bits in links
+                  for pvs_index, (path, path_bits)
+                      in enumerate(pvs[pvs_indices[-1] + 1:], pvs_indices[-1] + 1)
+#                       in enumerate(pvs)
+                  if link_bits & path_bits == 0
+                 ]
+    else:
+        # Set-based collision detection (backward compat / doctests)
+        result = [(link + [path], pvs_indices + [pvs_index], link_ps | path_ps)
+                  for link, pvs_indices, link_ps in links
+                  for pvs_index, (path, path_ps)
+                      in enumerate(pvs[pvs_indices[-1] + 1:], pvs_indices[-1] + 1)
+#                       in enumerate(pvs)
+                  if link_ps.isdisjoint(path_ps)
+                 ]
 #     return remove_duplicates(result, lambda t: t[0], lattice)
     return result
 
 
-def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattice=None):
+def tangle_gen(links, pvs, lattice=1):
+    # type: (...) -> Generator[tuple[Link, list[int], int]]
+    """Generator version of tangle(). Yields results one at a time
+    to avoid building the full list in memory.
+    Only supports bit-based collision detection (the fast path).
+    """
+    for link, pvs_indices, link_bits in links:
+        for pvs_index, (path, path_bits) in enumerate(
+                pvs[pvs_indices[-1] + 1:], pvs_indices[-1] + 1):
+            if link_bits & path_bits == 0:
+                yield (link + [path], pvs_indices + [pvs_index],
+                       link_bits | path_bits)
+
+
+def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattice=None,
+                   filter_planar=False):
     # type: (Path, int, int, int) -> (list[Link], list[Path])
     """Generate all unique links with n copies of path.
     Also return the selected path variations.
@@ -1074,6 +1437,7 @@ def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattic
     Parameter `min_move` is minimum moving distance (squared)
     Parameter `prospects_cap` caps the number of prospects (0 for no cap)
     Parameter `stage_cap` caps the number of links between stages (0 for no cap)
+    Parameter `filter_planar` if True, remove links where no path pierces another's disk
     
     Assumptions:
     * n >= 1
@@ -1104,33 +1468,44 @@ def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattic
     base_path = pv[0]
 #     print("base path:", base_path)
     base_ps = pointset_path(base_path)
-    pvs = [(shifted_path, ps)
-           for vec in generate_shifts(min_link(pv), max_link(pv), offset, min_move,
-                                      lattice)
-           for p in pv
-           for shifted_path in [shift_path(p, vec)]
-           for ps in [pointset_path(shifted_path)]
-           if ps.isdisjoint(base_ps)
-          ]
+    # First pass: collect non-intersecting prospects using sets
+    pvs_sets = [(shifted_path, ps)
+                for vec in generate_shifts(min_link(pv), max_link(pv), offset, min_move,
+                                           lattice)
+                for p in pv
+                for shifted_path in [shift_path(p, vec)]
+                for ps in [pointset_path(shifted_path)]
+                if ps.isdisjoint(base_ps)
+               ]
     if prospects_cap:
-        pvs = pvs[:prospects_cap]
+        pvs_sets = pvs_sets[:prospects_cap]
+    # Build BitGrid covering base_path and all prospects
+    all_paths_for_grid = [base_path] + [sp for sp, _ in pvs_sets]
+    grid = make_bitgrid(all_paths_for_grid)
+    # Convert to bitmasks
+    base_bits = grid.pointset_to_bits(base_ps)
+    pvs = [(sp, grid.pointset_to_bits(ps)) for sp, ps in pvs_sets]
 #     print("len(pvs):", len(pvs))
 #     from pprint import pprint
 #     pprint(pvs)
-    result = [([base_path], [-1], base_ps)]
+    result = [([base_path], [-1], base_bits)]
     
     # TODO: add statistics output
     # TODO: add extra cap on results of each stage
     # TODO: check that duplicate removal after each stage does not miss links
     for k in range(2, n + 1):
-        result = tangle(result, pvs, lattice)
-        print("number of links before capping with", k, "paths:", len(result))
         if stage_cap:
-            result = result[:stage_cap]  # no sorting yet
+            # Generator path: only materialize up to stage_cap results
+            result = list(islice(tangle_gen(result, pvs, lattice), stage_cap))
+        else:
+            result = tangle(result, pvs, lattice)
         print("number of links with", k, "paths:", len(result))
-        
+    
 #    return ([link for link, _, _ in result], [p for p, _ in pvs])
-    return (remove_duplicates([link for link, _, _ in result], lattice=lattice), [p for p, _ in pvs])
+    links = remove_duplicates([link for link, _, _ in result], lattice=lattice)
+    if filter_planar:
+        links = filter_unlinked(links)
+    return (links, [p for p, _ in pvs])
 
 
 if __name__ == "__main__":

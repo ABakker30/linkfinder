@@ -19,6 +19,10 @@ env/
 *.swp
 *.swo
 
+# Build tools
+tcc/
+build_dll.py
+
 # OS
 Thumbs.db
 .DS_Store

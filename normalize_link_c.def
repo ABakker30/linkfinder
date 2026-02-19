@@ -1,0 +1,5 @@
+LIBRARY normalize_link_c.dll
+
+EXPORTS
+normalize_link_c
+normalize_links_batch_c
