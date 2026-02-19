@@ -1331,13 +1331,14 @@ def make_bitgrid(paths):
     return BitGrid((min_x, min_y, min_z), size_y, size_z)
 
 
-def generate_shifts(min_vec, max_vec, offset=0, min_move=0, lattice=1):
-    # type: (Vector, Vector, int, int) -> list[Vector]
+def generate_shifts(min_vec, max_vec, offset=0, min_move=0, lattice=1, step_size=1):
+    # type: (Vector, Vector, int, int, int, int) -> list[Vector]
     """Generate list of all vectors within the box shell, sorted on length,
     restricted by lattice.
     
     min_move is _square_ of minimum move distance
     lattice: 1 -> SC, 2 -> FCC, 3 -> BCC
+    step_size: only keep vectors whose coordinates are all multiples of step_size
     
     >>> generate_shifts((0, 3, 6), (1, 4, 7))
     [(0, 3, 6), (1, 3, 6), (0, 4, 6), (1, 4, 6), (0, 3, 7), (1, 3, 7), (0, 4, 7), (1, 4, 7)]
@@ -1365,6 +1366,7 @@ def generate_shifts(min_vec, max_vec, offset=0, min_move=0, lattice=1):
                for z in range(min_z - offset, max_z + offset + 1)
                if is_in_lattice((x, y, z), lattice)
                if square_length((x, y, z)) >= min_move
+               if x % step_size == 0 and y % step_size == 0 and z % step_size == 0
               ]
     result = sorted(vectors, key=square_length)
     print(len(result), "shift vectors (sorted):", result)
@@ -1428,7 +1430,7 @@ def tangle_gen(links, pvs, lattice=1):
 
 
 def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattice=None,
-                   filter_planar=False):
+                   filter_planar=False, step_size=1):
     # type: (Path, int, int, int) -> (list[Link], list[Path])
     """Generate all unique links with n copies of path.
     Also return the selected path variations.
@@ -1438,6 +1440,7 @@ def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattic
     Parameter `prospects_cap` caps the number of prospects (0 for no cap)
     Parameter `stage_cap` caps the number of links between stages (0 for no cap)
     Parameter `filter_planar` if True, remove links where no path pierces another's disk
+    Parameter `step_size` lattice step unit size (1 or 2)
     
     Assumptions:
     * n >= 1
@@ -1471,7 +1474,7 @@ def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattic
     # First pass: collect non-intersecting prospects using sets
     pvs_sets = [(shifted_path, ps)
                 for vec in generate_shifts(min_link(pv), max_link(pv), offset, min_move,
-                                           lattice)
+                                           lattice, step_size)
                 for p in pv
                 for shifted_path in [shift_path(p, vec)]
                 for ps in [pointset_path(shifted_path)]

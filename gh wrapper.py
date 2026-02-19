@@ -9,6 +9,7 @@
         prospects_cap: cap on number of prospects (Item Access with Type hint int)
         stage_cap: cap on number of links per stage (Item Access with Type hint int)
         filter_planar: filter out links with no disk piercing (Item Access with Type hint bool)
+        step_size: lattice step unit size, 1 or 2 (Item Access with Type hint int)
         enable: if not, copy input to output (Item Access with Type hint bool)
         reload_linklib: whether to reload linklib (Item Access with Type hint bool)
     Output:
@@ -33,7 +34,7 @@ if enable:
     print("Points in path:", len(p))
 
     ls, pvs = ll.generate_links(p, n, offset, min_move, prospects_cap, stage_cap, lattice,
-                                  filter_planar=filter_planar)
+                                  filter_planar=filter_planar, step_size=step_size)
     print("Links:", len(ls))
     print("Prospects:", len(pvs))
 
