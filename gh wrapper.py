@@ -18,10 +18,14 @@ __version__ = "2024.04.02"
 
 import rhinoscriptsyntax as rs
 import Rhino.Geometry as rg
-import linklib as ll
+import sys
+if r"C:\Users\Owner\Documents\link finder" not in sys.path:
+    sys.path.insert(0, r"C:\Users\Owner\Documents\link finder")
+import linklibDEV as ll
+print("Loaded module:", ll.__name__, "from:", ll.__file__)
 if reload_linklib:
     reload(ll)
-    print("linklib reloaded:", ll._version)
+    print("linklibDEV reloaded:", ll._version)
 
 if enable:
     p = ll.import_path(path)
