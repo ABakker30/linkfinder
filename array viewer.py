@@ -9,6 +9,7 @@ Outputs:
     pipes: DataTree[object]  (Brep)
     colors: DataTree[object] (Color)
     pipe_r_used: float
+    cluster_pts: list of Point3d center points for each displayed cluster
 """
 
 import Rhino.Geometry as rg
@@ -111,6 +112,7 @@ def palette_color(i):
 pipes = DataTree[object]()
 colors = DataTree[object]()
 pipe_r_used = 0.0
+cluster_pts = []
 
 if (not enable) or (links is None):
     pass
@@ -188,3 +190,12 @@ else:
             for b in breps:
                 pipes.Add(b, out_path)
                 colors.Add(colr, out_path)
+
+        # Center point of the translated cluster bounding box
+        tbb = rg.BoundingBox.Empty
+        for c in curves:
+            cc = c.DuplicateCurve()
+            cc.Transform(xform)
+            tbb = rg.BoundingBox.Union(tbb, cc.GetBoundingBox(True))
+        if tbb.IsValid:
+            cluster_pts.append(tbb.Center)
