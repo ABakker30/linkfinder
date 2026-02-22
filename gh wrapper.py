@@ -2,8 +2,8 @@
 # env: C:\Users\Owner\Documents\link finder\
 """Provides a scripting component Link Generator.
     Inputs:
-        path: to be linked (Item Access with Type hint Polyline)
-        n: number of copies to link (Item Access with Type hint int)
+        paths: path shapes to be linked (List Access with Type hint Polyline)
+        n: number of copies per shape (Item Access with Type hint int)
         offset: steps beyond bounding box for path translations (Item Access with Type hint int)
         min_move: minimum distance to move paths (Item Access with Type hint int)
         prospects_cap: cap on number of prospects (Item Access with Type hint int)
@@ -15,6 +15,8 @@
     Output:
         links: The output variable (DataTree with Polyline)
         prospects: Secondary output variable (List Access with Polyline)
+        stats: search statistics summary (Item Access with str)
+        symmetry_counts: symmetry count per link (List Access with int)
 """
 
 __author__ = "Tom Verhoeff"
@@ -30,10 +32,11 @@ if reload_linklib:
     print("linklibDEV reloaded:", ll._version)
 
 if enable:
-    p = ll.import_path(path)
-    print("Points in path:", len(p))
+    p = [ll.import_path(path) for path in paths]
+    print("Shapes:", len(p), "Points per shape:", [len(s) for s in p])
 
-    ls, pvs = ll.generate_links(p, n, offset, min_move, prospects_cap, stage_cap, lattice,
+    ls, pvs, stats, symmetry_counts = ll.generate_links(p, n, offset, min_move, prospects_cap,
+                                  stage_cap, lattice,
                                   filter_planar=filter_planar, step_size=step_size)
     print("Links:", len(ls))
     print("Prospects:", len(pvs))
@@ -44,4 +47,6 @@ if enable:
 else:
     print('DISABLED')
     links = ll.export_links([])
-    prospects = [path]
+    prospects = []
+    stats = ""
+    symmetry_counts = []

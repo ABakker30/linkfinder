@@ -1152,6 +1152,26 @@ def link_variations(link, lattice=None):
            )
 
 
+def link_symmetry_count(link, lattice=None):
+    # type: (Link, int) -> int
+    """Count how many of the 48 cube symmetries map a link to itself.
+    
+    >>> link = [[(1, 0, 0), (0, 1, 0), (-1, 0, 0), (0, -1, 0)]]
+    >>> link_symmetry_count(link, 2)
+    16
+    """
+    if not lattice:
+        lattice = detect_lattice(link[0])
+    link = snap_link(link, lattice)
+    canonical = normalize_paths(align_link(link, lattice))
+    count = 0
+    for f in CUBE_SYMMETRY:
+        transformed = normalize_paths(align_link(transform_link(f, link), lattice))
+        if transformed == canonical:
+            count += 1
+    return count
+
+
 def normalize_links(links, key=None, lattice=1):
     # type: (list[T]) -> list[tuple[T, int, Link]]
     """Normalize all links, retaining the originals with their index.
@@ -1429,15 +1449,17 @@ def tangle_gen(links, pvs, lattice=1):
                        link_bits | path_bits)
 
 
-def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattice=None,
+def generate_links(paths, n, offset, min_move, prospects_cap, stage_cap=0, lattice=None,
                    filter_planar=False, step_size=1):
-    # type: (Path, int, int, int) -> (list[Link], list[Path])
-    """Generate all unique links with n copies of path.
+    # type: (list[Path] | Path, int, int, int) -> (list[Link], list[Path])
+    """Generate all unique links with n copies of each path shape.
     Also return the selected path variations.
     
+    Parameter `paths` is a single path or list of k path shapes.
+    Parameter `n` is the number of copies per shape (total paths = k * n).
     Parameter `offset` (from bounding box) bounds the translations.
     Parameter `min_move` is minimum moving distance (squared)
-    Parameter `prospects_cap` caps the number of prospects (0 for no cap)
+    Parameter `prospects_cap` caps the number of prospects per shape (0 for no cap)
     Parameter `stage_cap` caps the number of links between stages (0 for no cap)
     Parameter `filter_planar` if True, remove links where no path pierces another's disk
     Parameter `step_size` lattice step unit size (1 or 2)
@@ -1458,57 +1480,120 @@ def generate_links(path, n, offset, min_move, prospects_cap, stage_cap=0, lattic
     ([[[(1, -1, 0), (1, 0, -1), (1, 1, 0), (1, 0, 1)], [(0, 0, 0), (0, 1, -1), (0, 2, 0), (0, 1, 1)]]], [[(0, 0, 0), (0, 1, -1), (0, 2, 0), (0, 1, 1)], [(0, -1, 1), (0, 0, 0), (0, 1, 1), (0, 0, 2)]])
     """
     assert n >= 1, "n >= 1 violated (n == %d)" % n
-    # Steps:
-    # 1. Generate path variations
-    # 2. Generate path translations
-    # 3. Repeatedly add another path variation and remove duplicate links
-    #    New path should not intersect/overlap others
+    
+    # Backward compat: single path -> wrap in list
+    if paths and isinstance(paths[0], tuple):
+        paths = [paths]
+    
+    k = len(paths)  # number of distinct shapes
     
     if not lattice:
-        lattice = detect_lattice(path)
-    path = snap_path(path, lattice)
-    pv, _ = path_variations(path, lattice)  # ignore returned symmetries
-    base_path = pv[0]
-#     print("base path:", base_path)
+        lattice = detect_lattice(paths[0])
+    
+    # Generate path variations for each shape
+    shape_pvs = []
+    nodes_per_shape = []
+    for path in paths:
+        path = snap_path(path, lattice)
+        pv, _ = path_variations(path, lattice)
+        shape_pvs.append(pv)
+        nodes_per_shape.append(len(path))
+    
+    # Use first shape's first variation as the base path
+    base_path = shape_pvs[0][0]
     base_ps = pointset_path(base_path)
-    # First pass: collect non-intersecting prospects using sets
-    pvs_sets = [(shifted_path, ps)
-                for vec in generate_shifts(min_link(pv), max_link(pv), offset, min_move,
-                                           lattice, step_size)
-                for p in pv
-                for shifted_path in [shift_path(p, vec)]
-                for ps in [pointset_path(shifted_path)]
-                if ps.isdisjoint(base_ps)
-               ]
-    if prospects_cap:
-        pvs_sets = pvs_sets[:prospects_cap]
-    # Build BitGrid covering base_path and all prospects
-    all_paths_for_grid = [base_path] + [sp for sp, _ in pvs_sets]
+    
+    # Generate prospect pools per shape: shifted variations that don't collide with base
+    all_pvs_sets = []
+    variations_per_shape = []
+    shifts_per_shape = []
+    for si, pv in enumerate(shape_pvs):
+        shifts = generate_shifts(min_link(pv), max_link(pv), offset, min_move,
+                                 lattice, step_size)
+        shifts_per_shape.append(len(shifts))
+        variations_per_shape.append(len(pv))
+        pvs_sets = [(shifted_path, ps)
+                    for vec in shifts
+                    for p in pv
+                    for shifted_path in [shift_path(p, vec)]
+                    for ps in [pointset_path(shifted_path)]
+                    if ps.isdisjoint(base_ps)
+                   ]
+        if prospects_cap:
+            pvs_sets = pvs_sets[:prospects_cap]
+        all_pvs_sets.append(pvs_sets)
+    
+    # Build one BitGrid covering base_path and all prospects from all shapes
+    all_paths_for_grid = [base_path]
+    for pvs_sets in all_pvs_sets:
+        all_paths_for_grid.extend(sp for sp, _ in pvs_sets)
     grid = make_bitgrid(all_paths_for_grid)
-    # Convert to bitmasks
+    
+    # Convert each shape's prospects to bitmasks
     base_bits = grid.pointset_to_bits(base_ps)
-    pvs = [(sp, grid.pointset_to_bits(ps)) for sp, ps in pvs_sets]
-#     print("len(pvs):", len(pvs))
-#     from pprint import pprint
-#     pprint(pvs)
+    shape_pools = []
+    for pvs_sets in all_pvs_sets:
+        pool = [(sp, grid.pointset_to_bits(ps)) for sp, ps in pvs_sets]
+        shape_pools.append(pool)
+    
+    # Start with base path (first copy of first shape)
     result = [([base_path], [-1], base_bits)]
+    path_count = 1
+    funnel = []  # (path_count, link_count) at each stage
     
-    # TODO: add statistics output
-    # TODO: add extra cap on results of each stage
-    # TODO: check that duplicate removal after each stage does not miss links
-    for k in range(2, n + 1):
-        if stage_cap:
-            # Generator path: only materialize up to stage_cap results
-            result = list(islice(tangle_gen(result, pvs, lattice), stage_cap))
-        else:
-            result = tangle(result, pvs, lattice)
-        print("number of links with", k, "paths:", len(result))
+    # Phase loop: for each shape, add n copies (first shape starts at n-1 since base is already in)
+    for si in range(k):
+        copies_needed = n if si > 0 else n - 1
+        pool = shape_pools[si]
+        for ci in range(copies_needed):
+            path_count += 1
+            # Reset pvs_indices for new shape phases (so tangle starts from index 0)
+            if ci == 0 and si > 0:
+                result = [(link, [-1], bits) for link, _, bits in result]
+            if stage_cap:
+                result = list(islice(tangle_gen(result, pool, lattice), stage_cap))
+            else:
+                result = tangle(result, pool, lattice)
+            funnel.append((path_count, len(result)))
+            print("number of links with", path_count, "paths:", len(result))
     
-#    return ([link for link, _, _ in result], [p for p, _ in pvs])
+    before_dedup = len(result)
     links = remove_duplicates([link for link, _, _ in result], lattice=lattice)
+    after_dedup = len(links)
     if filter_planar:
         links = filter_unlinked(links)
-    return (links, [p for p, _ in pvs])
+    after_filter = len(links)
+    
+    # Compute per-link symmetry counts
+    sym_counts = [link_symmetry_count(link, lattice) for link in links]
+    
+    # Build stats string
+    total_paths = k * n
+    total_nodes = sum(nodes_per_shape) * n
+    lines = []
+    lines.append("=== Link Search Stats ===")
+    lines.append("Shapes: %d, Copies per shape: %d, Total paths per link: %d" % (k, n, total_paths))
+    for si in range(k):
+        candidates = shifts_per_shape[si] * variations_per_shape[si]
+        lines.append("  Shape %d: %d nodes, %d variations, %d shifts, %d candidates -> %d prospects"
+                      % (si + 1, nodes_per_shape[si], variations_per_shape[si],
+                         shifts_per_shape[si], candidates, len(shape_pools[si])))
+    lines.append("Total nodes per link: %d" % total_nodes)
+    lines.append("--- Search Funnel ---")
+    lines.append("  Stage 1: 1 link (base path)")
+    for pc, lc in funnel:
+        lines.append("  Stage %d: %d links (before dedup)" % (pc, lc))
+    lines.append("  After dedup: %d" % after_dedup)
+    if filter_planar:
+        lines.append("  After planar filter: %d" % after_filter)
+    lines.append("========================")
+    stats = "\n".join(lines)
+    print(stats)
+    
+    all_prospects = []
+    for pool in shape_pools:
+        all_prospects.extend(p for p, _ in pool)
+    return (links, all_prospects, stats, sym_counts)
 
 
 if __name__ == "__main__":
