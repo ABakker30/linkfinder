@@ -1564,8 +1564,11 @@ def generate_links(paths, n, offset, min_move, prospects_cap, stage_cap=0, latti
         links = filter_unlinked(links)
     after_filter = len(links)
     
-    # Compute per-link symmetry counts
+    # Compute per-link symmetry counts and sort by descending symmetry
     sym_counts = [link_symmetry_count(link, lattice) for link in links]
+    paired = sorted(zip(sym_counts, links), key=lambda x: -x[0])
+    sym_counts = [s for s, _ in paired]
+    links = [l for _, l in paired]
     
     # Build stats string
     total_paths = k * n
