@@ -1039,17 +1039,19 @@ def is_linked(link):
     # type: (Link) -> bool
     """Check if every path in a link intersects at least one other path's surface.
     A link is kept only if NO path has zero intersections with all other surfaces.
+    Only applies when ALL paths are planar; mixed links pass automatically.
     """
     n = len(link)
     # Precompute planes for all paths
     planes = [is_planar(p) for p in link]
+    # If any path is non-planar, skip the filter entirely
+    if any(p is None for p in planes):
+        return True
     for i in range(n):
         # Does path i intersect any other path's surface?
         has_intersection = False
         for j in range(n):
             if i == j:
-                continue
-            if planes[j] is None:
                 continue
             normal, offset = planes[j]
             if curve_intersects_surface(link[i], link[j], normal, offset):
